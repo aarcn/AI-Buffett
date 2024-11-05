@@ -1,86 +1,77 @@
-import yfinance as yf
 import pandas as pd
-from textblob import TextBlob
-from datetime import datetime
+from stock_data import fetch_stock_data, calculate_moving_averages
+from sentiment_analysis import read_news_file
+from strategy import generate_signals, calculate_returns
+from backtest import backtest_strategy
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
 
-# Function to read and calculate daily sentiment scores from a text file of headlines
-def read_news_file(file_path):
-    daily_sentiments = {}
-
-    with open(file_path, 'r') as file:
-        for line in file:
-            try:
-                # Assume each line is "YYYY-MM-DD headline text"
-                date_str, headline = line.strip().split(' ', 1)
-                date = datetime.strptime(date_str, '%Y-%m-%d').date()
-
-                # Calculate sentiment score for the headline
-                sentiment = TextBlob(headline).sentiment.polarity
-
-                # Store sentiment by date
-                if date not in daily_sentiments:
-                    daily_sentiments[date] = []
-                daily_sentiments[date].append(sentiment)
-            except ValueError:
-                print(f"Skipping malformed line: {line}")
-
-    # Average sentiment score per day
-    daily_sentiment_scores = {date: sum(scores) / len(scores) for date, scores in daily_sentiments.items()}
-    sentiment_df = pd.DataFrame(list(daily_sentiment_scores.items()), columns=['Date', 'Sentiment_Score'])
-    sentiment_df['Date'] = pd.to_datetime(sentiment_df['Date']).dt.tz_localize(None)  # Remove timezone info
-    return sentiment_df
-
-# 1. Fetch Historical Stock Data
 symbol = 'AAPL'
-data = yf.download(symbol, start='2020-01-01', end='2023-01-01')
-data = data[['Close']].reset_index()  # Reset index to ensure `Date` is a column, not an index
+start_date = '2020-01-01'
+end_date = '2023-01-01'
+news_file_path = 'news_headlines.txt'
 
-# Remove timezone info from Date column in `data`
-data['Date'] = data['Date'].dt.tz_localize(None)
+stock_data = fetch_stock_data(symbol, start_date, end_date)
 
-# Flatten the MultiIndex columns
-data.columns = ['Date', 'Close']
+stock_data_with_ma = calculate_moving_averages(stock_data)
 
-# 2. Calculate Moving Averages
-data['MA50'] = data['Close'].rolling(window=50).mean()
-data['MA200'] = data['Close'].rolling(window=200).mean()
+if isinstance(stock_data_with_ma.columns, pd.MultiIndex):
+    stock_data_with_ma.columns = ['Date', 'Close', 'MA50', 'MA200']
 
-# Load sentiment data from a text file
-news_file_path = 'news_headlines.txt'  # Replace with your file path
-sentiment_data = read_news_file(news_file_path).reset_index(drop=True)  # Ensure `Date` is a column, not an index
+sentiment_data = read_news_file(news_file_path)
 
-# Merge stock data with sentiment data on the 'Date' column
-data = data.merge(sentiment_data, on='Date', how='left')
-data['Sentiment_Score'] = data['Sentiment_Score'].fillna(0)  # Fill missing scores with 0 (neutral)
+sentiment_data.reset_index(drop=True, inplace=True)
 
-# Debug: Check the structure before merging
-print("Data columns:", data.columns)
-print("Sentiment data columns:", sentiment_data.columns)
+print("Stock Data Columns:", stock_data_with_ma.columns)
+print("Sentiment Data Columns:", sentiment_data.columns)
+print("Is Stock Data MultiIndex?", isinstance(stock_data_with_ma.columns, pd.MultiIndex))
+print("Is Sentiment Data MultiIndex?", isinstance(sentiment_data.columns, pd.MultiIndex))
 
-# 3. Generate Buy/Sell Signals incorporating sentiment with adjusted conditions
-data['Signal'] = 0
-data.loc[(data['MA50'] > data['MA200']) & (data['Sentiment_Score'] >= 0), 'Signal'] = 1  # Buy signal
-data.loc[(data['MA50'] < data['MA200']) & (data['Sentiment_Score'] <= 0), 'Signal'] = -1  # Sell signal
+merged_data = stock_data_with_ma.merge(sentiment_data, on='Date', how='left')
+merged_data['Sentiment_Score'] = merged_data['Sentiment_Score'].fillna(0)  # Fill missing scores with 0 (neutral)
 
-# Shift signals by one day to reflect the previous day's signal
-signals = data['Signal'].shift(1)
+final_data = generate_signals(merged_data)
 
-# Check the number of buy/sell signals generated
-print("Buy signals:", (data['Signal'] == 1).sum())
-print("Sell signals:", (data['Signal'] == -1).sum())
+print("Buy signals:", (final_data['Signal'] == 1).sum())
+print("Sell signals:", (final_data['Signal'] == -1).sum())
 
-# 4. Calculate Returns Based on Signals
-daily_returns = data['Close'].pct_change()
-data['Strategy_Return'] = signals * daily_returns
+cumulative_return = calculate_returns(final_data)
 
-# Compute cumulative returns
-cumulative_return = (1 + data['Strategy_Return'].fillna(0)).cumprod() - 1
 print(f"Final Cumulative Return with News Sentiment: {cumulative_return.iloc[-1]:.2%}")
 
-# Print sentiment score summary
-print("Sentiment Score Summary:")
-print(data['Sentiment_Score'].describe())
+def prepare_data_for_prediction(data):
+    features = data[['Close', 'MA50', 'MA200', 'Sentiment_Score']]
+    labels = data['Close'].shift(-1)
+    features = features[:-1]
+    labels = labels[:-1]
 
-# Print sample rows where signals are generated
+    features = features.dropna()
+    labels = labels.loc[features.index]  # Align labels with features after dropping NaN
+    return features, labels
+
+def train_and_predict(features, labels):
+    X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=0.2, random_state=42)
+
+    model = LinearRegression()
+    model.fit(X_train, y_train)
+
+    next_day_prediction = model.predict(X_test)
+    return next_day_prediction, y_test
+
+features, labels = prepare_data_for_prediction(final_data)
+
+if features.empty or labels.empty:
+    print("No valid data available for prediction.")
+else:
+    next_day_prediction, true_values = train_and_predict(features, labels)
+
+    print("Predicted next day closing prices:", next_day_prediction)
+    print("True next day closing prices:", true_values.values)
+
+backtest_strategy(final_data)
+
+print("Sentiment Score Summary:")
+print(final_data['Sentiment_Score'].describe())
+
 print("Sample rows with signals:")
-print(data[data['Signal'] != 0].head(10))
+print(final_data[final_data['Signal'] != 0].head(10))
