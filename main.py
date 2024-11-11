@@ -46,7 +46,7 @@ def prepare_data_for_prediction(data):
     labels = labels[:-1]
 
     features = features.dropna()
-    labels = labels.loc[features.index]  # Align labels with features after dropping NaN
+    labels = labels.loc[features.index]
     return features, labels
 
 def train_and_predict(features, labels):
